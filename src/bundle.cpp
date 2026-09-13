@@ -3,6 +3,8 @@
 #include "macho.h"
 #include "sys/stat.h"
 #include "sys/types.h"
+#include <sstream>
+#include <functional>
 
 ZBundle::ZBundle()
 {
@@ -16,6 +18,7 @@ ZBundle::ZBundle()
 	m_bRemoveWatchApp = false;
 	m_bRemoveUISupportedDevices = false;
 	m_bInjectExtensions = false;
+	m_bFixDeviceFamily = false;
 }
 
 bool ZBundle::FindAppFolder(const string& strFolder, string& strAppFolder)
@@ -86,7 +89,7 @@ bool ZBundle::GetSignFolderInfo(const string& strFolder, jvalue& jvNode, bool bG
 bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 {
 	vector<string> allBundles;
-	
+
 	std::function<void(const string&)> findAllBundles = [&](const string& currentPath) {
 		ZFile::EnumFolder(currentPath.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
 			if (bFolder) {
@@ -103,23 +106,23 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 			return false;
 		});
 	};
-	
+
 	findAllBundles(strFolder);
-	
+
 	sort(allBundles.begin(), allBundles.end(), [](const string& a, const string& b) {
 		size_t depthA = count(a.begin(), a.end(), '/');
 		size_t depthB = count(b.begin(), b.end(), '/');
 		// deeper paths first
 		return depthA > depthB;
 	});
-	
+
 	for (const string& bundlePath : allBundles) {
 		jvalue jvNode;
 		if (GetSignFolderInfo(bundlePath, jvNode)) {
 			jvInfo["folders"].push_back(jvNode);
 		}
 	}
-	
+
 	ZFile::EnumFolder(strFolder.c_str(), true, NULL, [&](bool bFolder, const string& strPath) {
 		if (bFolder || string::npos != strPath.find(".dSYM") ||
 			string::npos != strPath.find("_WatchKitStub")) {
@@ -175,7 +178,7 @@ bool ZBundle::GenerateCodeResources(const string& strFolder, jvalue& jvCodeRes)
 
 	setFiles.erase("_CodeSignature/CodeResources");
 	setFiles.erase(strBundleExe);
-	
+
 	jvCodeRes.clear();
 	jvCodeRes["files"] = jvalue(jvalue::E_OBJECT);
 	jvCodeRes["files2"] = jvalue(jvalue::E_OBJECT);
@@ -322,7 +325,7 @@ bool ZBundle::SignNode(jvalue& jvNode)
 			}
 		}
 	}
-	
+
 	if (jvNode.has("folders")) {
 		for (size_t i = 0; i < jvNode["folders"].size(); i++) {
 			if (!SignNode(jvNode["folders"][i])) {
@@ -774,6 +777,80 @@ void ZBundle::ApplyAppModifications()
 	}
 }
 
+// ============================================================================
+// PATCH: Fix UIDeviceFamily
+// ============================================================================
+
+void ZBundle::SetFixDeviceFamily(const vector<int>& arrFamily)
+{
+	m_bFixDeviceFamily = true;
+	m_arrDeviceFamily = arrFamily;
+}
+
+void ZBundle::ApplyDeviceFamilyFix()
+{
+	if (!m_bFixDeviceFamily || m_arrDeviceFamily.empty()) {
+		return;
+	}
+
+	// Tập hợp tất cả bundle: app chính + mọi .app/.appex con (đệ quy)
+	vector<string> arrBundles;
+	arrBundles.push_back(m_strAppFolder);
+
+	std::function<void(const string&)> collectBundles = [&](const string& folder) {
+		ZFile::EnumFolder(folder.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
+			if (bFolder) {
+				if (ZFile::IsPathSuffix(strPath, ".app") || ZFile::IsPathSuffix(strPath, ".appex")) {
+					arrBundles.push_back(strPath);
+					collectBundles(strPath);
+				} else {
+					collectBundles(strPath);
+				}
+			}
+			return false;
+		});
+	};
+	collectBundles(m_strAppFolder);
+
+	for (const string& strBundle : arrBundles) {
+		string strPlist = strBundle + "/Info.plist";
+
+		jvalue jvInfo;
+		if (!jvInfo.read_plist_from_file(strPlist.c_str())) {
+			ZLog::WarnV(">>> Can't read Info.plist for device family fix: %s\n", strBundle.c_str());
+			continue;
+		}
+
+		jvalue jvArr;
+		for (int val : m_arrDeviceFamily) {
+			jvArr.push_back(val);
+		}
+		jvInfo["UIDeviceFamily"] = jvArr;
+
+		if (!jvInfo.style_write_plist_to_file(strPlist.c_str())) {
+			ZLog::ErrorV(">>> Can't write Info.plist: %s\n", strBundle.c_str());
+			continue;
+		}
+
+		// Log
+		string strFamilyLog;
+		for (size_t i = 0; i < m_arrDeviceFamily.size(); i++) {
+			if (i > 0) strFamilyLog += ",";
+			char buf[16];
+			snprintf(buf, sizeof(buf), "%d", m_arrDeviceFamily[i]);
+			strFamilyLog += buf;
+		}
+		string strRelative = strBundle.substr(m_strAppFolder.size());
+		if (strRelative.empty()) strRelative = "/";
+		ZLog::PrintV(">>> UIDeviceFamily: %s -> [%s]\n",
+					 strRelative.c_str(), strFamilyLog.c_str());
+
+		m_bForceSign = true;
+	}
+}
+
+// ============================================================================
+
 bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 							const string& strFolder,
 							const string& strBundleId,
@@ -822,6 +899,9 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 			return false;
 		}
 	}
+
+	// === PATCH: Force set UIDeviceFamily SAU tất cả modify, TRƯỚC khi ký ===
+	ApplyDeviceFamilyFix();
 
 	ZFile::RemoveFileV("%s/embedded.mobileprovision", m_strAppFolder.c_str());
 	if (!pSignAsset->m_strProvData.empty()) {
