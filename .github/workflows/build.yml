@@ -34,7 +34,7 @@ jobs:
             echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe" | sudo tee -a /etc/apt/sources.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe" | sudo tee -a /etc/apt/sources.list
             sudo apt-get update
-            sudo apt-get install -y libssl-dev:arm64
+            sudo apt-get install -y libssl-dev:arm64 libplist-dev:arm64
           else
             sudo apt-get install -y g++ pkg-config libssl-dev libplist-dev
           fi
@@ -56,10 +56,12 @@ jobs:
             aarch64-linux-gnu-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c -o unzip.o
             aarch64-linux-gnu-g++ -std=c++11 -O3 -Wno-unused-result $VF \
               -I./src -I./src/common -I./src/third-party/zlib \
+              -I/usr/include/aarch64-linux-gnu \
               $(find src -name "*.cpp") \
               *.o \
               -L/usr/lib/aarch64-linux-gnu \
               -lssl -lcrypto \
+              -lplist-2.0 \
               -o bin/zsign
           else
             cd build/linux && make clean && make VERSION="$VER" -j$(nproc)
@@ -82,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: install deps
-        run: brew install pkg-config openssl
+        run: brew install pkg-config openssl libplist
 
       - name: build
         run: |
@@ -124,7 +126,6 @@ jobs:
             $defs = "ZSIGN_VERSION=$ver"
             $nums = @(($ver -replace '[^0-9.].*$', '') -split '\.' | Where-Object { $_ -ne '' })
             while ($nums.Count -lt 3) { $nums += '0' }
-            # %2C = escaped comma: msbuild /p: splits raw commas into separate properties (MSB1006)
             $rdefs = "ZSIGN_VERSION_NUM=$($nums[0])%2C$($nums[1])%2C$($nums[2])%2C0"
           }
           msbuild build\windows\vs2022\zsign.sln /p:Configuration=Release /p:Platform=x64 /p:ExtraDefines="$defs" /p:ExtraResourceDefines="$rdefs" /m
@@ -183,7 +184,16 @@ jobs:
           make install_sw
           cd ..
 
-          echo "=== zlib is bundled in src/third-party/zlib ==="
+          echo "=== building libplist ==="
+          curl -sL https://github.com/libimobiledevice/libplist/releases/download/2.3.0/libplist-2.3.0.tar.bz2 | tar xj
+          cd libplist-2.3.0
+          export CC=$CC CXX=$CXX AR=$AR
+          export CFLAGS="-D__ANDROID_API__=$API"
+          export CXXFLAGS="-D__ANDROID_API__=$API"
+          ./configure --host=${{ matrix.ndk_target }} --prefix=$DEPS --enable-static --disable-shared
+          make -j$(nproc)
+          make install
+          cd ..
 
       - name: build zsign
         env:
@@ -210,7 +220,7 @@ jobs:
             -I./src -I./src/common -I./src/third-party/zlib -I$DEPS/include \
             $(find src -name "*.cpp") \
             *.o \
-            -L$DEPS/lib -lssl -lcrypto \
+            -L$DEPS/lib -lssl -lcrypto -lplist-2.0 \
             -static-libstdc++ \
             -o bin/zsign
           file bin/zsign
@@ -240,7 +250,7 @@ jobs:
           FROM ubuntu:22.04 AS builder
           ARG VERSION
           RUN apt-get update && \
-              apt-get install -y g++ make pkg-config libssl-dev && \
+              apt-get install -y g++ make pkg-config libssl-dev libplist-dev && \
               rm -rf /var/lib/apt/lists/*
           COPY . /src
           WORKDIR /src/build/linux
@@ -248,7 +258,7 @@ jobs:
 
           FROM ubuntu:22.04
           RUN apt-get update && \
-              apt-get install -y libssl3 && \
+              apt-get install -y libssl3 libplist3 && \
               rm -rf /var/lib/apt/lists/*
           COPY --from=builder /src/bin/zsign /usr/local/bin/zsign
           ENTRYPOINT ["zsign"]
@@ -281,21 +291,24 @@ jobs:
           docker build --build-arg VERSION="$VER" -t zsign-musl -f - . <<'MUSL'
           FROM alpine:3.19 AS builder
           ARG VERSION
-          RUN apk add --no-cache g++ make pkgconf openssl-dev openssl-libs-static
+          RUN apk add --no-cache g++ make pkgconf openssl-dev openssl-libs-static \
+              libplist-dev libplist-static
           COPY . /src
           WORKDIR /src
           RUN VF=""; [ -n "$VERSION" ] && VF="-DZSIGN_VERSION=$VERSION"; \
               for f in src/third-party/zlib/*.c; do cc -O3 -I./src/third-party/zlib -c "$f"; done && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-partyiz/minizip/ioapi.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizipip/zip.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/min/unzip.c && \
               mkdir -p bin && g++ -std=c++11 -O3 -static -Wno-unused-result $VF \
             -include cstdint -include ctime \
             -I./src -I./src/common -I./src/third-party/zlib \
             $(pkg-config --cflags openssl) \
+            $(pkg-config --cflags libplist-2.0) \
             $(find src -name "*.cpp") \
             *.o \
             $(pkg-config --libs --static openssl) \
+            $(pkg-config --libs --static libplist-2.0) \
             -o bin/zsign && strip bin/zsign
           MUSL
           mkdir -p bin
@@ -329,7 +342,7 @@ jobs:
           echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy main restricted universe" | sudo tee -a /etc/apt/sources.list
           echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy-updates main restricted universe" | sudo tee -a /etc/apt/sources.list
           sudo apt-get update
-          sudo apt-get install -y libssl-dev:armhf
+          sudo apt-get install -y libssl-dev:armhf libplist-dev:armhf
 
       - name: build
         run: |
@@ -351,6 +364,7 @@ jobs:
             *.o \
             -L/usr/lib/arm-linux-gnueabihf \
             -lssl -lcrypto \
+            -lplist-2.0 \
             -o bin/zsign
 
       - name: verify arch
@@ -375,7 +389,7 @@ jobs:
           usesh: true
           envs: 'TAG_NAME'
           prepare: |
-            pkg install -y openssl pkgconf gmake
+            pkg install -y openssl pkgconf gmake libplist
           run: |
             VER=""
             case "$TAG_NAME" in
