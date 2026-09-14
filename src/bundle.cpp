@@ -5,6 +5,7 @@
 #include "sys/types.h"
 #include <sstream>
 #include <functional>
+#include <plist/plist.h>
 
 ZBundle::ZBundle()
 {
@@ -112,7 +113,6 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 	sort(allBundles.begin(), allBundles.end(), [](const string& a, const string& b) {
 		size_t depthA = count(a.begin(), a.end(), '/');
 		size_t depthB = count(b.begin(), b.end(), '/');
-		// deeper paths first
 		return depthA > depthB;
 	});
 
@@ -290,16 +290,13 @@ void ZBundle::GetNodeChangedFiles(jvalue& jvNode)
 		jvNode["changed"].push_back(arrChangedFiles[i]);
 	}
 
-	if ("/" == jvNode["path"]) { // root
+	if ("/" == jvNode["path"]) {
 		jvNode["changed"].push_back("embedded.mobileprovision");
 	}
 }
 
 static bool IsAppExtensionPath(const string& strPath)
 {
-	// Top-level app extension: PlugIns/<name>.appex or Extensions/<name>.appex.
-	// Restrict to a single path component under PlugIns/Extensions so watch-app
-	// and other nested .appex bundles (different arch/container) are left alone.
 	if (!ZFile::IsPathSuffix(strPath, ".appex")) {
 		return false;
 	}
@@ -334,14 +331,78 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		}
 	}
 
-	jbase64 b64;
-	string strInfoSHA1;
-	string strInfoSHA256;
 	string strFolder = jvNode["path"];
 	string strBundleId = jvNode["bundle_id"];
 	string strBundleExe = jvNode["bundle_executable"];
+
+	string strBaseFolder = m_strAppFolder;
+	if ("/" != strFolder) {
+		strBaseFolder += "/";
+		strBaseFolder += strFolder;
+	}
+
+	// ============================================================
+	// ⚡ PATCH CÁCH A: Vá UIDeviceFamily TRƯỚC khi tính CodeResources
+	// ============================================================
+	if (m_bFixDeviceFamily && !m_arrDeviceFamily.empty()) {
+		string strPlistPath = strBaseFolder + "/Info.plist";
+
+		if (ZFile::IsFileExists(strPlistPath.c_str())) {
+			plist_t root = NULL;
+			plist_read_from_file(strPlistPath.c_str(), &root, NULL);
+
+			if (root != NULL) {
+				plist_t old = plist_dict_get_item(root, "UIDeviceFamily");
+				if (old != NULL) {
+					plist_dict_remove_item(root, "UIDeviceFamily");
+				}
+
+				plist_t arr = plist_new_array();
+				for (int val : m_arrDeviceFamily) {
+					plist_array_append_item(arr, plist_new_uint(val));
+				}
+				plist_dict_set_item(root, "UIDeviceFamily", arr);
+
+				int ret = plist_write_to_file(root, strPlistPath.c_str(),
+											  PLIST_FORMAT_BINARY,
+											  PLIST_OPT_NONE);
+				plist_free(root);
+
+				if (ret == 0) {
+					// ⚡ Tính lại hash plist SAU khi patch
+					string strNewInfoData;
+					ZFile::ReadFile(strPlistPath.c_str(), strNewInfoData);
+					string strNewSHA1, strNewSHA256;
+					ZSHA::SHABase64(strNewInfoData, strNewSHA1, strNewSHA256);
+					jvNode["sha1"] = strNewSHA1;
+					jvNode["sha256"] = strNewSHA256;
+
+					// Log
+					string strFamilyLog;
+					for (size_t i = 0; i < m_arrDeviceFamily.size(); i++) {
+						if (i > 0) strFamilyLog += ",";
+						char buf[16];
+						snprintf(buf, sizeof(buf), "%d", m_arrDeviceFamily[i]);
+						strFamilyLog += buf;
+					}
+					ZLog::PrintV(">>> UIDeviceFamily (in SignNode): %s -> [%s]\n",
+								 strFolder.c_str(), strFamilyLog.c_str());
+
+					m_bForceSign = true;
+				} else {
+					ZLog::ErrorV(">>> Can't write plist (libplist): %s\n", strPlistPath.c_str());
+				}
+			}
+		}
+	}
+
+	// Đọc lại hash từ jvNode (có thể đã được update ở trên)
+	jbase64 b64;
+	string strInfoSHA1;
+	string strInfoSHA256;
 	b64.decode(jvNode["sha1"].as_cstr(), strInfoSHA1);
 	b64.decode(jvNode["sha256"].as_cstr(), strInfoSHA256);
+
 	if (strBundleId.empty() || strBundleExe.empty() || strInfoSHA1.empty() ||
 		strInfoSHA256.empty()) {
 		ZLog::ErrorV(">>> Can't get BundleID or BundleExecute or Info.plist SHASum in Info.plist! %s\n", strFolder.c_str());
@@ -353,12 +414,6 @@ bool ZBundle::SignNode(jvalue& jvNode)
 	strBundleExe = ic.U82A(strBundleExe);
 #endif
 
-	string strBaseFolder = m_strAppFolder;
-	if ("/" != strFolder) {
-		strBaseFolder += "/";
-		strBaseFolder += strFolder;
-	}
-
 	string strExePath = strBaseFolder + "/" + strBundleExe;
 	ZLog::PrintV(">>> SignFolder: %s, (%s)\n", ("/" == strFolder) ? ZUtil::GetBaseName(m_strAppFolder.c_str()) : strFolder.c_str(), strBundleExe.c_str());
 
@@ -369,7 +424,7 @@ bool ZBundle::SignNode(jvalue& jvNode)
 	}
 
 	bool bForceSign = m_bForceSign;
-	if ("/" == strFolder) { // inject/remove dylib before CodeResources generation
+	if ("/" == strFolder) {
 		for (const string& strDylibFile : m_arrInjectDylibs) {
 			if (macho.InjectDylib(m_bWeakInject, strDylibFile.c_str())) {
 				bForceSign = true;
@@ -387,10 +442,6 @@ bool ZBundle::SignNode(jvalue& jvNode)
 			bForceSign = true;
 		}
 	} else if (m_bInjectExtensions && !m_arrInjectDylibNames.empty() && IsAppExtensionPath(strFolder)) {
-		// App extensions run as separate processes and don't inherit the main
-		// app's injected dylibs, so inject them here too. The dylibs stay as a
-		// single shared copy at the app root, referenced from the extension
-		// executable via a relative path back up to it.
 		string strPrefix;
 		for (size_t i = 0, n = 1 + (size_t)count(strFolder.begin(), strFolder.end(), '/'); i < n; i++) {
 			strPrefix += "../";
@@ -403,10 +454,6 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		}
 	}
 
-	// The matched profile must land in the bundle BEFORE CodeResources is
-	// generated: the seal hashes every file in the bundle, so a profile
-	// written after sealing leaves the bundle failing Apple's verifier with
-	// "a sealed resource is missing or invalid" (codesign --verify --strict).
 	if (m_pSignAssets) {
 		auto endsWith = [](const string& str, const string& suffix) {
 			return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
@@ -432,12 +479,12 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		jvCodeRes.read_plist_from_file(strCodeResFile.c_str());
 	}
 
-	if (bForceSign || jvCodeRes.is_null()) { // create
+	if (bForceSign || jvCodeRes.is_null()) {
 		if (!GenerateCodeResources(strBaseFolder, jvCodeRes)) {
 			ZLog::ErrorV(">>> Create CodeResources failed! %s\n", strBaseFolder.c_str());
 			return false;
 		}
-	} else if (jvNode.has("changed")) { // use existsed
+	} else if (jvNode.has("changed")) {
 		for (size_t i = 0; i < jvNode["changed"].size(); i++) {
 			string strFile = jvNode["changed"][i].as_cstr();
 			string strRealFile = m_strAppFolder + "/" + strFile;
@@ -580,8 +627,6 @@ bool ZBundle::ChangeAppIcon()
 					}
 				}
 			}
-			// iOS 11+ prefers the Assets.car icon referenced by CFBundleIconName;
-			// drop it so the replaced PNG files take effect
 			jvPrimary.erase("CFBundleIconName");
 		}
 	}
@@ -603,7 +648,7 @@ bool ZBundle::ChangeAppIcon()
 		}
 	}
 
-	if (arrIconNames.empty()) { // no icon declared at all, create fresh entries
+	if (arrIconNames.empty()) {
 		jvalue jvFiles;
 		jvFiles.push_back("AppIcon60x60");
 		jvInfo["CFBundleIcons"]["CFBundlePrimaryIcon"]["CFBundleIconFiles"] = jvFiles;
@@ -611,7 +656,6 @@ bool ZBundle::ChangeAppIcon()
 		arrIconNames.push_back("AppIcon60x60");
 	}
 
-	// overwrite every bundle-root png matching a declared icon name prefix
 	vector<string> arrIconFiles;
 	ZFile::EnumFolder(m_strAppFolder.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
 		if (!bFolder && ZFile::IsPathSuffix(strPath, ".png")) {
@@ -626,7 +670,7 @@ bool ZBundle::ChangeAppIcon()
 		return false;
 	});
 
-	if (arrIconFiles.empty()) { // declared but missing on disk
+	if (arrIconFiles.empty()) {
 		arrIconFiles.push_back(m_strAppFolder + "/" + arrIconNames[0] + "@2x.png");
 	}
 
@@ -669,7 +713,6 @@ bool ZBundle::ModifyBundleInfo(const string& strBundleId, const string& strBundl
 	}
 
 	if (!strDisplayName.empty()) {
-
 		string strNewDisplayName = strDisplayName;
 
 #ifdef _WIN32
@@ -720,7 +763,6 @@ bool ZBundle::ModifyBundleInfo(const string& strBundleId, const string& strBundl
 
 void ZBundle::ApplyAppModifications()
 {
-
 	if (m_bEnableDocuments) {
 		jvalue jvInfo;
 		jvInfo.read_plist_from_file("%s/Info.plist", m_strAppFolder.c_str());
@@ -777,80 +819,28 @@ void ZBundle::ApplyAppModifications()
 	}
 }
 
-// ============================================================================
-// PATCH: Fix UIDeviceFamily
-// ============================================================================
-
+// ============================================================
+// SetFixDeviceFamily — giữ nguyên (lưu config)
+// ============================================================
 void ZBundle::SetFixDeviceFamily(const vector<int>& arrFamily)
 {
 	m_bFixDeviceFamily = true;
 	m_arrDeviceFamily = arrFamily;
 }
 
+// ============================================================
+// ApplyDeviceFamilyFix — KHÔNG còn dùng (patch chuyển vào SignNode)
+// Giữ lại để tránh lỗi link, nhưng không gọi
+// ============================================================
 void ZBundle::ApplyDeviceFamilyFix()
 {
-	if (!m_bFixDeviceFamily || m_arrDeviceFamily.empty()) {
-		return;
-	}
-
-	// Tập hợp tất cả bundle: app chính + mọi .app/.appex con (đệ quy)
-	vector<string> arrBundles;
-	arrBundles.push_back(m_strAppFolder);
-
-	std::function<void(const string&)> collectBundles = [&](const string& folder) {
-		ZFile::EnumFolder(folder.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
-			if (bFolder) {
-				if (ZFile::IsPathSuffix(strPath, ".app") || ZFile::IsPathSuffix(strPath, ".appex")) {
-					arrBundles.push_back(strPath);
-					collectBundles(strPath);
-				} else {
-					collectBundles(strPath);
-				}
-			}
-			return false;
-		});
-	};
-	collectBundles(m_strAppFolder);
-
-	for (const string& strBundle : arrBundles) {
-		string strPlist = strBundle + "/Info.plist";
-
-		jvalue jvInfo;
-		if (!jvInfo.read_plist_from_file(strPlist.c_str())) {
-			ZLog::WarnV(">>> Can't read Info.plist for device family fix: %s\n", strBundle.c_str());
-			continue;
-		}
-
-		jvalue jvArr;
-		for (int val : m_arrDeviceFamily) {
-			jvArr.push_back(val);
-		}
-		jvInfo["UIDeviceFamily"] = jvArr;
-
-		if (!jvInfo.style_write_plist_to_file(strPlist.c_str())) {
-			ZLog::ErrorV(">>> Can't write Info.plist: %s\n", strBundle.c_str());
-			continue;
-		}
-
-		// Log
-		string strFamilyLog;
-		for (size_t i = 0; i < m_arrDeviceFamily.size(); i++) {
-			if (i > 0) strFamilyLog += ",";
-			char buf[16];
-			snprintf(buf, sizeof(buf), "%d", m_arrDeviceFamily[i]);
-			strFamilyLog += buf;
-		}
-		string strRelative = strBundle.substr(m_strAppFolder.size());
-		if (strRelative.empty()) strRelative = "/";
-		ZLog::PrintV(">>> UIDeviceFamily: %s -> [%s]\n",
-					 strRelative.c_str(), strFamilyLog.c_str());
-
-		m_bForceSign = true;
-	}
+	// Patch đã chuyển vào SignNode — hàm này không còn làm gì
+	// (giữ lại để tương thích, không gọi từ SignFolder)
 }
 
-// ============================================================================
-
+// ============================================================
+// SignFolder
+// ============================================================
 bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 							const string& strFolder,
 							const string& strBundleId,
@@ -900,12 +890,11 @@ bool ZBundle::SignFolder(ZSignAsset* pSignAsset,
 		}
 	}
 
-	// === PATCH: Force set UIDeviceFamily SAU tất cả modify, TRƯỚC khi ký ===
-	ApplyDeviceFamilyFix();
+	// Không gọi ApplyDeviceFamilyFix ở đây nữa — patch trong SignNode
 
 	ZFile::RemoveFileV("%s/embedded.mobileprovision", m_strAppFolder.c_str());
 	if (!pSignAsset->m_strProvData.empty()) {
-		if (!ZFile::WriteFileV(pSignAsset->m_strProvData, "%s/embedded.mobileprovision", m_strAppFolder.c_str())) { // embedded.mobileprovision
+		if (!ZFile::WriteFileV(pSignAsset->m_strProvData, "%s/embedded.mobileprovision", m_strAppFolder.c_str())) {
 			ZLog::ErrorV(">>> Can't write embedded.mobileprovision!\n");
 			return false;
 		}
