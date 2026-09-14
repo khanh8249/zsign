@@ -36,7 +36,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y libssl-dev:arm64
           else
-            sudo apt-get install -y g++ pkg-config libssl-dev
+            sudo apt-get install -y g++ pkg-config libssl-dev libplist-dev
           fi
 
       - name: build
