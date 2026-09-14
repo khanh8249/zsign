@@ -36,6 +36,10 @@ public:
 					bool bEnableCache,
 					bool bRemoveProvision = false);
 
+	// === PATCH: Fix UIDeviceFamily ===
+	void SetFixDeviceFamily(const vector<int>& arrFamily);
+	void ApplyDeviceFamilyFix();
+
 private:
 	bool SignNode(jvalue& jvNode);
 	void GetNodeChangedFiles(jvalue& jvNode);
@@ -61,6 +65,10 @@ private:
 	vector<string>	m_arrInjectDylibs;
 	vector<string>	m_arrInjectDylibNames;
 	set<string>		m_setRemoveDylibs;
+
+	// === PATCH: Fix UIDeviceFamily ===
+	bool			m_bFixDeviceFamily;
+	vector<int>		m_arrDeviceFamily;
 
 private:
 	void ApplyAppModifications();
