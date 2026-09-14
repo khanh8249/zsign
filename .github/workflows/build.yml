@@ -21,25 +21,58 @@ jobs:
             cross: false
           - arch: aarch64
             cross: true
+            host: aarch64-linux-gnu
+            triplet: aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
       - name: install deps
         run: |
           sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev \
+            git autoconf automake libtool-bin checkinstall wget
           if [ "${{ matrix.cross }}" = "true" ]; then
-            sudo apt-get install -y g++-aarch64-linux-gnu
+            sudo apt-get install -y g++-${{ matrix.host }}
             sudo dpkg --add-architecture arm64
             sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe" | sudo tee -a /etc/apt/sources.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe" | sudo tee -a /etc/apt/sources.list
             sudo apt-get update
-            sudo apt-get install -y libssl-dev:arm64 libplist-dev:arm64
-          else
-            sudo apt-get install -y g++ pkg-config libssl-dev libplist-dev
+            sudo apt-get install -y libssl-dev:arm64
           fi
 
-      - name: build
+      - name: build libplist (${{ matrix.arch }})
+        run: |
+          git clone --depth 1 --branch 2.3.0 https://github.com/libimobiledevice/libplist.git
+          cd libplist
+          ./autogen.sh
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            ./configure \
+              --host=${{ matrix.host }} \
+              --prefix=/usr/${{ matrix.triplet }} \
+              --without-cython \
+              --enable-static --disable-shared
+          else
+            ./configure --prefix=/usr --without-cython
+          fi
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig 2>/dev/null || true
+          cd ..
+          rm -rf libplist
+
+      - name: verify libplist
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            ls -la /usr/${{ matrix.triplet }}/include/plist/plist.h
+            ls -la /usr/${{ matrix.triplet }}/lib/libplist*
+          else
+            pkg-config --cflags --libs libplist-2.0
+            ls -la /usr/include/plist/plist.h
+          fi
+
+      - name: build zsign
         run: |
           VER=""
           if [[ "${{ github.ref_name }}" == v* ]]; then
@@ -50,16 +83,17 @@ jobs:
           [ -n "$VER" ] && VF="-DZSIGN_VERSION=$VER"
           if [ "${{ matrix.cross }}" = "true" ]; then
             mkdir -p bin
-            for f in src/third-party/zlib/*.c; do aarch64-linux-gnu-gcc -O3 -Wno-unused-result -I./src/third-party/zlib -c "$f" -o "$(basename "$f" .c).o"; done
-            aarch64-linux-gnu-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c -o ioapi.o
-            aarch64-linux-gnu-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c -o zip.o
-            aarch64-linux-gnu-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c -o unzip.o
-            aarch64-linux-gnu-g++ -std=c++11 -O3 -Wno-unused-result $VF \
+            for f in src/third-party/zlib/*.c; do ${{ matrix.host }}-gcc -O3 -Wno-unused-result -I./src/third-party/zlib -c "$f" -o "$(basename "$f" .c).o"; done
+            ${{ matrix.host }}-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c -o ioapi.o
+            ${{ matrix.host }}-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c -o zip.o
+            ${{ matrix.host }}-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c -o unzip.o
+            ${{ matrix.host }}-g++ -std=c++11 -O3 -Wno-unused-result $VF \
               -I./src -I./src/common -I./src/third-party/zlib \
-              -I/usr/include/aarch64-linux-gnu \
+              -I/usr/${{ matrix.triplet }}/include \
               $(find src -name "*.cpp") \
               *.o \
-              -L/usr/lib/aarch64-linux-gnu \
+              -L/usr/${{ matrix.triplet }}/lib \
+              -L/usr/lib/${{ matrix.triplet }} \
               -lssl -lcrypto \
               -lplist-2.0 \
               -o bin/zsign
@@ -68,6 +102,9 @@ jobs:
             strip ../../bin/zsign
           fi
 
+      - name: verify arch
+        run: file bin/zsign
+
       - name: smoke test
         if: matrix.cross == false
         run: ./bin/zsign -v
@@ -75,6 +112,80 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: zsign-linux-${{ matrix.arch }}
+          path: bin/zsign
+
+  build-linux-armv7:
+    name: Build Linux (armv7)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            git autoconf automake libtool-bin checkinstall wget \
+            g++-arm-linux-gnueabihf
+          sudo dpkg --add-architecture armhf
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy main restricted universe" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy-updates main restricted universe" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev:armhf
+
+      - name: build libplist (armv7)
+        run: |
+          git clone --depth 1 --branch 2.3.0 https://github.com/libimobiledevice/libplist.git
+          cd libplist
+          ./autogen.sh
+          ./configure \
+            --host=arm-linux-gnueabihf \
+            --prefix=/usr/arm-linux-gnueabihf \
+            --without-cython \
+            --enable-static --disable-shared
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig 2>/dev/null || true
+          cd ..
+          rm -rf libplist
+
+      - name: verify libplist
+        run: |
+          ls -la /usr/arm-linux-gnueabihf/include/plist/plist.h
+          ls -la /usr/arm-linux-gnueabihf/lib/libplist*
+
+      - name: build zsign
+        run: |
+          VER=""
+          if [[ "${{ github.ref_name }}" == v* ]]; then
+            VER="${{ github.ref_name }}"
+            VER="${VER#v}"
+          fi
+          VF=""
+          [ -n "$VER" ] && VF="-DZSIGN_VERSION=$VER"
+          mkdir -p bin
+          for f in src/third-party/zlib/*.c; do arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src/third-party/zlib -c "$f" -o "$(basename "$f" .c).o"; done
+          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c -o ioapi.o
+          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c -o zip.o
+          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c -o unzip.o
+          arm-linux-gnueabihf-g++ -std=c++11 -O3 -Wno-unused-result $VF \
+            -I./src -I./src/common -I./src/third-party/zlib \
+            -I/usr/arm-linux-gnueabihf/include \
+            $(find src -name "*.cpp") \
+            *.o \
+            -L/usr/arm-linux-gnueabihf/lib \
+            -L/usr/lib/arm-linux-gnueabihf \
+            -lssl -lcrypto \
+            -lplist-2.0 \
+            -o bin/zsign
+
+      - name: verify arch
+        run: file bin/zsign
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zsign-linux-armv7
           path: bin/zsign
 
   build-macos:
@@ -123,10 +234,12 @@ jobs:
           $rdefs = ""
           if ("${{ github.ref_name }}" -like "v*") {
             $ver = "${{ github.ref_name }}".Substring(1)
-            $defs = "ZSIGN_VERSION=$ver"
+            $defs = "ZSIGN_VERSION=$ver;ZSIGN_USE_PYTHON_PLIST"
             $nums = @(($ver -replace '[^0-9.].*$', '') -split '\.' | Where-Object { $_ -ne '' })
             while ($nums.Count -lt 3) { $nums += '0' }
             $rdefs = "ZSIGN_VERSION_NUM=$($nums[0])%2C$($nums[1])%2C$($nums[2])%2C0"
+          } else {
+            $defs = "ZSIGN_USE_PYTHON_PLIST"
           }
           msbuild build\windows\vs2022\zsign.sln /p:Configuration=Release /p:Platform=x64 /p:ExtraDefines="$defs" /p:ExtraResourceDefines="$rdefs" /m
 
@@ -162,15 +275,12 @@ jobs:
         with:
           ndk-version: r26d
 
-      - name: build deps
+      - name: build openssl
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           set -e
           TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
-          CC=$TOOLCHAIN/bin/${{ matrix.ndk_target }}${API}-clang
-          CXX=$TOOLCHAIN/bin/${{ matrix.ndk_target }}${API}-clang++
-          AR=$TOOLCHAIN/bin/llvm-ar
           DEPS=$PWD/android-deps
           mkdir -p $DEPS
 
@@ -187,13 +297,23 @@ jobs:
           echo "=== building libplist ==="
           curl -sL https://github.com/libimobiledevice/libplist/releases/download/2.3.0/libplist-2.3.0.tar.bz2 | tar xj
           cd libplist-2.3.0
-          export CC=$CC CXX=$CXX AR=$AR
-          export CFLAGS="-D__ANDROID_API__=$API"
-          export CXXFLAGS="-D__ANDROID_API__=$API"
-          ./configure --host=${{ matrix.ndk_target }} --prefix=$DEPS --enable-static --disable-shared
+          export CC=$TOOLCHAIN/bin/${{ matrix.ndk_target }}${API}-clang
+          export CXX=$TOOLCHAIN/bin/${{ matrix.ndk_target }}${API}-clang++
+          export AR=$TOOLCHAIN/bin/llvm-ar
+          export CFLAGS="-D__ANDROID_API__=$API -fPIC"
+          export CXXFLAGS="-D__ANDROID_API__=$API -fPIC"
+          ./configure --host=${{ matrix.ndk_target }} \
+            --prefix=$DEPS \
+            --enable-static --disable-shared \
+            --without-cython --without-python \
+            --without-docs --without-tools
           make -j$(nproc)
           make install
           cd ..
+
+          echo "=== verify ==="
+          ls -la $DEPS/lib/libplist* 2>&1 || echo "MISSING libplist"
+          ls -la $DEPS/include/plist/ 2>&1 || echo "MISSING headers"
 
       - name: build zsign
         env:
@@ -250,8 +370,16 @@ jobs:
           FROM ubuntu:22.04 AS builder
           ARG VERSION
           RUN apt-get update && \
-              apt-get install -y g++ make pkg-config libssl-dev libplist-dev && \
-              rm -rf /var/lib/apt/lists/*
+              apt-get install -y g++ make pkg-config libssl-dev \
+                                 git autoconf automake libtool-bin
+          RUN git clone --depth 1 --branch 2.3.0 https://github.com/libimobiledevice/libplist.git && \
+              cd libplist && \
+              ./autogen.sh && \
+              ./configure --prefix=/usr --without-cython && \
+              make -j$(nproc) && \
+              make install && \
+              ldconfig && \
+              cd .. && rm -rf libplist
           COPY . /src
           WORKDIR /src/build/linux
           RUN make clean && make VERSION="$VERSION" -j$(nproc) && strip ../../bin/zsign
@@ -292,14 +420,21 @@ jobs:
           FROM alpine:3.19 AS builder
           ARG VERSION
           RUN apk add --no-cache g++ make pkgconf openssl-dev openssl-libs-static \
-              libplist-dev libplist-static
+                                 git autoconf automake libtool build-base
+          RUN git clone --depth 1 --branch 2.3.0 https://github.com/libimobiledevice/libplist.git && \
+              cd libplist && \
+              ./autogen.sh && \
+              ./configure --prefix=/usr --without-cython --enable-static --disable-shared && \
+              make -j$(nproc) && \
+              make install && \
+              cd .. && rm -rf libplist
           COPY . /src
           WORKDIR /src
           RUN VF=""; [ -n "$VERSION" ] && VF="-DZSIGN_VERSION=$VERSION"; \
               for f in src/third-party/zlib/*.c; do cc -O3 -I./src/third-party/zlib -c "$f"; done && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-partyiz/minizip/ioapi.c && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizipip/zip.c && \
-              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/min/unzip.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c && \
+              cc -O3 -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c && \
               mkdir -p bin && g++ -std=c++11 -O3 -static -Wno-unused-result $VF \
             -include cstdint -include ctime \
             -I./src -I./src/common -I./src/third-party/zlib \
@@ -326,54 +461,6 @@ jobs:
         with:
           name: zsign-linux-musl-static
           path: bin/zsign-musl
-
-  build-linux-armv7:
-    name: Build Linux (armv7)
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install cross-compiler and deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-arm-linux-gnueabihf
-          sudo dpkg --add-architecture armhf
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy main restricted universe" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=armhf] http://ports.ubuntu.com/ jammy-updates main restricted universe" | sudo tee -a /etc/apt/sources.list
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev:armhf libplist-dev:armhf
-
-      - name: build
-        run: |
-          VER=""
-          if [[ "${{ github.ref_name }}" == v* ]]; then
-            VER="${{ github.ref_name }}"
-            VER="${VER#v}"
-          fi
-          VF=""
-          [ -n "$VER" ] && VF="-DZSIGN_VERSION=$VER"
-          mkdir -p bin
-          for f in src/third-party/zlib/*.c; do arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src/third-party/zlib -c "$f" -o "$(basename "$f" .c).o"; done
-          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/ioapi.c -o ioapi.o
-          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/zip.c -o zip.o
-          arm-linux-gnueabihf-gcc -O3 -Wno-unused-result -I./src -I./src/third-party/zlib -c src/third-party/minizip/unzip.c -o unzip.o
-          arm-linux-gnueabihf-g++ -std=c++11 -O3 -Wno-unused-result $VF \
-            -I./src -I./src/common -I./src/third-party/zlib \
-            $(find src -name "*.cpp") \
-            *.o \
-            -L/usr/lib/arm-linux-gnueabihf \
-            -lssl -lcrypto \
-            -lplist-2.0 \
-            -o bin/zsign
-
-      - name: verify arch
-        run: file bin/zsign
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zsign-linux-armv7
-          path: bin/zsign
 
   build-freebsd:
     name: Build FreeBSD (x86_64)
