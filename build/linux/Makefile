@@ -10,8 +10,12 @@ NC = \033[0m
 OPENSSL_INCLUDE = $(shell pkg-config --cflags openssl)
 OPENSSL_LIB = $(shell pkg-config --libs openssl)
 
+# === PATCH: libplist for binary plist patching ===
+PLIST_INCLUDE = $(shell pkg-config --cflags libplist-2.0)
+PLIST_LIB = $(shell pkg-config --libs libplist-2.0)
+
 INCLUDES = -I../../src -I../../src/common -I../../src/third-party/zlib
-INCLUDES += $(OPENSSL_INCLUDE)
+INCLUDES += $(OPENSSL_INCLUDE) $(PLIST_INCLUDE)
 
 # Version derived from git tag (strip leading 'v'); override with `make VERSION=x.y.z`
 VERSION ?= $(shell git -C ../.. describe --tags --always 2>/dev/null | sed 's/^v//')
@@ -20,7 +24,7 @@ VERSION := 0.0.0-dev
 endif
 CXXFLAGS += -DZSIGN_VERSION=$(VERSION)
 
-LIBS = $(OPENSSL_LIB)
+LIBS = $(OPENSSL_LIB) $(PLIST_LIB)
 
 OBJDIR = .build
 BINDIR = ../../bin
@@ -47,7 +51,7 @@ MINIZIP_PC = minizip
 CXXFLAGS += -DZSIGN_SYSTEM_MINIZIP
 endif
 INCLUDES = -I../../src -I../../src/common
-INCLUDES += $(OPENSSL_INCLUDE) $(shell pkg-config --cflags $(MINIZIP_PC))
+INCLUDES += $(OPENSSL_INCLUDE) $(PLIST_INCLUDE) $(shell pkg-config --cflags $(MINIZIP_PC))
 LIBS += $(shell pkg-config --libs $(MINIZIP_PC))
 LIBS += $(shell pkg-config --libs zlib)
 ZLIB_OBJS =
@@ -63,7 +67,7 @@ $(TARGET): $(OBJS) $(ZLIB_OBJS) $(MINIZIP_OBJS)
 	@mkdir -p $(BINDIR)
 	$(CXX) $(OBJS) $(ZLIB_OBJS) $(MINIZIP_OBJS) $(LIBS) -o $(TARGET)
 
-$(OBJDIR)/%.o: ../../src/%.cpp
+$(OBJDIR)/%.o #: ../../src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
