@@ -1,6 +1,7 @@
 #include "common.h"
 #include <list>
 #include <set>
+#include <sstream>
 #include "macho.h"
 #include "bundle.h"
 #include "openssl.h"
@@ -55,6 +56,7 @@ const struct option options[] = {
 	{"rm_watch", no_argument, NULL, 'W'},
 	{"rm_uisd", no_argument, NULL, 'U'},
 	{"inject_extensions", no_argument, NULL, 'P'},
+	{"fix_device_family", required_argument, NULL, 'F'},
 	{"help", no_argument, NULL, 'h'},
 	{}
 };
@@ -140,8 +142,8 @@ int usage()
 	ZLog::Print("-D, --rm_dylib\t\tName of dylib to remove. Use -D multiple times to remove multiple dylibs at once.\n");
 	ZLog::Print("-w, --weak\t\tInject dylib as LC_LOAD_WEAK_DYLIB.\n");
 	ZLog::Print("-i, --install\t\tInstall ipa file using ideviceinstaller command for test.\n");
-	ZLog::Print("-t, --temp_folder\tPath to temporary folder for intermediate files.\n");
-	ZLog::Print("-2, --sha256_only\t(Deprecated, now the default.) Kept for backward compatibility.\n");
+	ZLog::Print("-t, default --temp_folder\tPath to temporary folder for intermediate files.\.)n");
+	ZLog::Print("-2, -- Kesha256_only\t(Deprecated, now thept for backward compatibility.\n");
 	ZLog::Print("-L, --legacy_sha1\tEmit a dual SHA1+SHA256 CodeDirectory for iOS <= 10 compatibility.\n");
 	ZLog::Print("-C, --check\t\tCheck certificate validity and OCSP revocation status.\n");
 	ZLog::Print("-q, --quiet\t\tQuiet operation.\n");
@@ -153,6 +155,7 @@ int usage()
 	ZLog::Print("-W, --rm_watch\t\tRemove watch app from the bundle.\n");
 	ZLog::Print("-U, --rm_uisd\t\tRemove UISupportedDevices from Info.plist.\n");
 	ZLog::Print("-P, --inject_extensions\tAlso inject -l dylibs into app extensions (PlugIns/Extensions).\n");
+	ZLog::Print("-F, --fix_device_family\tForce UIDeviceFamily to given values. Example: -F 1,2 (iPhone+iPad)\n");
 	ZLog::Print("-v, --version\t\tShows version.\n");
 	ZLog::Print("-h, --help\t\tShows help (this message).\n");
 
@@ -178,6 +181,7 @@ int main(int argc, char* argv[])
 	bool bRemoveUISupportedDevices = false;
 	bool bInjectExtensions = false;
 	uint32_t uZipLevel = 0;
+	vector<int> arrFixDeviceFamily;
 
 	string strCertFile;
 	string strPKeyFile;
@@ -197,7 +201,7 @@ int main(int argc, char* argv[])
 
 	int opt = 0;
 	int argslot = -1;
-	while (-1 != (opt = getopt_long(argc, argv, "dfva2LhiqwCRSEWUPc:k:m:o:p:e:b:n:z:l:D:t:r:x:M:I:",
+	while (-1 != (opt = getopt_long(argc, argv, "dfva2LhiqwCRSEWUPF:c:k:m:o:p:e:b:n:z:l:D:t:r:x:M:I:",
 		options, &argslot))) {
 		switch (opt) {
 		case 'd':
@@ -294,6 +298,23 @@ int main(int argc, char* argv[])
 			break;
 		case 'P':
 			bInjectExtensions = true;
+			break;
+		case 'F': {
+			string strList = optarg;
+			stringstream ss(strList);
+			string token;
+			while (std::getline(ss, token, ',')) {
+				token.erase(0, token.find_first_not_of(" \t"));
+				token.erase(token.find_last_not_of(" \t") + 1);
+				if (!token.empty()) {
+					arrFixDeviceFamily.push_back(atoi(token.c_str()));
+				}
+			}
+			if (arrFixDeviceFamily.empty()) {
+				ZLog::Error(">>> --fix_device_family requires at least one integer (e.g. 1,2)\n");
+				return -1;
+			}
+			}
 			break;
 		case 'v': {
 			printf("version: %s\n", ZSIGN_VERSION_STR);
@@ -453,6 +474,11 @@ int main(int argc, char* argv[])
 	bundle.m_bRemoveWatchApp = bRemoveWatchApp;
 	bundle.m_bRemoveUISupportedDevices = bRemoveUISupportedDevices;
 	bundle.m_bInjectExtensions = bInjectExtensions;
+
+	// === PATCH: Fix UIDeviceFamily ===
+	if (!arrFixDeviceFamily.empty()) {
+		bundle.SetFixDeviceFamily(arrFixDeviceFamily);
+	}
 
 	bool bRet;
 	if (arrProvFiles.size() > 1) {
